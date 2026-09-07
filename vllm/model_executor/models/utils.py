@@ -11,7 +11,6 @@ import regex as re
 import torch
 import torch.nn as nn
 from torch.nn.modules.module import register_module_module_registration_hook
-
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -34,8 +33,8 @@ from vllm.utils.torch_utils import (
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
     from transformers.conversion_mapping import WeightRenaming
-
     from vllm.config.model import ModelConfig
+
     from vllm.model_executor.layers.quantization import QuantizationConfig
 
 logger = init_logger(__name__)
@@ -515,6 +514,17 @@ def maybe_fuse_shared_experts(
     for name, loaded_weight in weights:
         if prefix not in name:
             yield name, loaded_weight
+            continue
+        if loaded_weight.ndim == 0:
+            if n_shared_experts != 1:
+                raise ValueError(
+                    f"FSE shared-expert scalar {name!r} cannot be split across "
+                    f"n_shared_experts={n_shared_experts}."
+                )
+            yield (
+                name.replace(prefix, f"mlp.experts.{n_routed_experts}."),
+                loaded_weight,
+            )
             continue
         # gate/up split on the output dim; down_proj on the input dim.
         split_dim = 1 if ("down_proj.weight" in name and loaded_weight.ndim > 1) else 0

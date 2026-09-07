@@ -32,7 +32,7 @@ from typing import Any
 import torch
 from torch import nn
 from transformers import PretrainedConfig
-
+from vllm._aiter_ops import rocm_aiter_ops
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig, get_current_vllm_config
 from vllm.distributed import (
@@ -56,7 +56,6 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -69,6 +68,8 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.hy_v3 import HYV3Config
 
+from vllm.model_executor.layers.quantization import QuantizationConfig
+
 from .interfaces import MixtureOfExperts, SupportsLoRA, SupportsPP
 from .utils import (
     AutoWeightsLoader,
@@ -77,6 +78,7 @@ from .utils import (
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
+    maybe_fuse_shared_experts,
     maybe_prefix,
 )
 
@@ -161,8 +163,14 @@ class HYV3MoEFused(nn.Module):
             prefix=f"{prefix}.gate",
         )
 
+        self.is_fusion_moe_shared_experts_enabled = (
+            rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+        )
         self.shared_mlp: HYV3FeedForward | None
-        if config.num_shared_experts > 0:
+        if (
+            config.num_shared_experts > 0
+            and not self.is_fusion_moe_shared_experts_enabled
+        ):
             self.shared_mlp = HYV3FeedForward(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.expert_hidden_dim * config.num_shared_experts,
@@ -196,7 +204,11 @@ class HYV3MoEFused(nn.Module):
             topk_group=1,
             routed_scaling_factor=router_scaling_factor,
             e_score_correction_bias=e_score_correction_bias,
-            n_shared_experts=config.num_shared_experts,
+            n_shared_experts=(
+                config.num_shared_experts
+                if self.is_fusion_moe_shared_experts_enabled
+                else None
+            ),
             shared_experts=self.shared_mlp,
         )
 
@@ -518,7 +530,12 @@ class HYV3Model(nn.Module, MixtureOfExperts):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.num_experts,
+            num_experts=self.config.num_experts
+            + (
+                self.config.num_shared_experts
+                if rocm_aiter_ops.is_fusion_moe_shared_experts_enabled()
+                else 0
+            ),
         )
 
     def forward(
@@ -556,6 +573,12 @@ class HYV3Model(nn.Module, MixtureOfExperts):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        weights = maybe_fuse_shared_experts(
+            weights,
+            n_routed_experts=self.config.num_experts,
+            n_shared_experts=self.config.num_shared_experts,
+            ckpt_prefix="mlp.shared_mlp",
+        )
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             (".qkv_proj", ".q_proj", "q"),

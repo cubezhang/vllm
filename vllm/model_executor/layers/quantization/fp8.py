@@ -4,7 +4,6 @@
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
-
 import vllm.envs as envs
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
@@ -25,9 +24,11 @@ from vllm.model_executor.layers.fused_moe import (
     UnquantizedFusedMoEMethod,
 )
 from vllm.model_executor.layers.fused_moe.config import (
+    FusedMoEParallelConfig,
     FusedMoEQuantConfig,
 )
 from vllm.model_executor.layers.fused_moe.oracle.fp8 import (
+    Fp8MoeBackend,
     convert_to_fp8_moe_kernel_format,
     make_fp8_moe_kernel,
     make_fp8_moe_quant_config,
@@ -39,7 +40,6 @@ from vllm.model_executor.layers.linear import (
     LinearMethodBase,
     UnquantizedLinearMethod,
 )
-from vllm.model_executor.layers.quantization import QuantizationMethods
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -83,6 +83,8 @@ from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     is_deep_gemm_supported,
 )
+
+from vllm.model_executor.layers.quantization import QuantizationMethods
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
@@ -554,6 +556,25 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             allow_vllm_cutlass=False,
         )
 
+    def maybe_roundup_sizes(
+        self,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        act_dtype: torch.dtype,
+        moe_parallel_config: FusedMoEParallelConfig,
+    ) -> tuple[int, int]:
+        hidden_size, intermediate_size_per_partition = super().maybe_roundup_sizes(
+            hidden_size,
+            intermediate_size_per_partition,
+            act_dtype,
+            moe_parallel_config,
+        )
+        if self.fp8_backend == Fp8MoeBackend.AITER and not self.block_quant:
+            intermediate_size_per_partition = (
+                (intermediate_size_per_partition + 127) // 128 * 128
+            )
+        return hidden_size, intermediate_size_per_partition
+
     def create_weights(
         self,
         layer: RoutedExperts,
@@ -762,6 +783,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         w2_scale = getattr(layer, f"w2_{self.weight_scale_name}")
         w13_input_scale = layer.w13_input_scale
         w2_input_scale = layer.w2_input_scale
+
+        # Padded regions are absent from the checkpoint and remain
+        # uninitialized after loading. Clear them before format conversion.
+        unpadded_intermediate = (
+            layer.moe_config.intermediate_size_per_partition_unpadded
+        )
+        padded_intermediate = layer.intermediate_size_per_partition
+        if padded_intermediate > unpadded_intermediate:
+            with torch.no_grad():
+                w13[:, unpadded_intermediate:padded_intermediate, :].zero_()
+                w13[
+                    :,
+                    padded_intermediate + unpadded_intermediate : 2
+                    * padded_intermediate,
+                    :,
+                ].zero_()
+                w2[:, :, unpadded_intermediate:padded_intermediate].zero_()
 
         # MI300x and MI325x use FNUZ format for FP8. Convert if needed.
         if current_platform.is_fp8_fnuz():
